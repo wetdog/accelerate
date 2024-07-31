@@ -1624,6 +1624,7 @@ class Accelerator:
         mapping = {p: new_named_params[n] for n, p in old_named_params.items()}
         for param_group in optimizer.param_groups:
             param_group['params'] = [mapping.get(p, p) for p in param_group['params']]
+
         return result
 
     def _prepare_deepspeed(self, *args):

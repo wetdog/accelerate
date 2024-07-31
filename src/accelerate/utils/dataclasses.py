@@ -1371,11 +1371,10 @@ class FullyShardedDataParallelPlugin:
                     else:
                         transformer_cls_to_wrap.add(transformer_cls)
 
-                import transformer_engine.pytorch as te
                 self.auto_wrap_policy = functools.partial(
                     transformer_auto_wrap_policy,
                     # Transformer layer class to wrap
-                    transformer_layer_cls={te.TransformerLayer},
+                    transformer_layer_cls=transformer_cls_to_wrap,
                 )
             elif auto_wrap_policy == FSDP_AUTO_WRAP_POLICY[1]:
                 min_num_params = int(os.environ.get("FSDP_MIN_NUM_PARAMS", 0))
