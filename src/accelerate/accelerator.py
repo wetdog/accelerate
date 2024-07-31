@@ -396,6 +396,8 @@ class Accelerator:
 
         self.delayed_fp8_autocast = False
         if self.fp8_recipe_handler is not None:
+            if self.state.mixed_precision != "fp8" and self.distributed_type != DistributedType.FSDP:
+                raise ValueError("Passing in a `FP8RecipeKwargs` object requires setting `mixed_precision='fp8'`.")
             # We already check if FP8 is available during `self.state`
             self.delayed_fp8_autocast = self.fp8_recipe_handler.backend == "TE" and self.distributed_type in (
                 DistributedType.MULTI_GPU,
@@ -1291,8 +1293,8 @@ class Accelerator:
         # If we're dealing with device placement, this deals with that by...
         tpu_should_fix_optimizer = self.device_placement and self.distributed_type == DistributedType.XLA
         if tpu_should_fix_optimizer:
-            # 1. grabbing old model parameters and store them
-            self.old_named_params = self._get_named_parameters(*args)
+            # 1. grabbing old model parameters
+            old_named_params = self._get_named_parameters(*args)
 
         if self.distributed_type in [DistributedType.MULTI_CPU, DistributedType.MULTI_XPU, DistributedType.NO]:
             if self.device.type == "cpu" and self.state.use_ipex:
@@ -1394,8 +1396,6 @@ class Accelerator:
                 with torch.no_grad():
                     convert_model(model)
                 model._converted_to_transformer_engine = True
-                # We need to then save these params now
-                self.old_named_params = self._get_named_parameters(model)
             kwargs = self.fp8_recipe_handler.to_kwargs() if self.fp8_recipe_handler is not None else {}
             if "fp8_format" in kwargs:
                 kwargs["fp8_format"] = getattr(te_recipe.Format, kwargs["fp8_format"])
