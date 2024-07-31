@@ -1177,6 +1177,7 @@ class Accelerator:
         self.state.print(*args, **kwargs)
 
     def _prepare_one(self, obj, first_pass=False, device_placement=None):
+        # First pass of preparation: DataLoader, model, optimizer
         if first_pass:
             if isinstance(obj, torch.utils.data.DataLoader):
                 return self.prepare_data_loader(obj, device_placement=device_placement)
@@ -1285,7 +1286,8 @@ class Accelerator:
                 )
 
         # If we're dealing with device placement, this deals with that by...
-        if self.should_fix_optimizer():
+        tpu_should_fix_optimizer = self.device_placement and self.distributed_type == DistributedType.XLA
+        if tpu_should_fix_optimizer:
             # 1. grabbing old model parameters and store them
             self.old_named_params = self._get_named_parameters(*args)
 
@@ -1310,6 +1312,15 @@ class Accelerator:
                 self._prepare_one(obj, first_pass=True, device_placement=d) for obj, d in zip(args, device_placement)
             )
             result = tuple(self._prepare_one(obj, device_placement=d) for obj, d in zip(result, device_placement))
+        if tpu_should_fix_optimizer:
+            # 2. grabbing new model parameters
+            new_named_params = self._get_named_parameters(*result)
+            # 3. building a map from the first to the second
+            mapping = {p: new_named_params[n] for n, p in old_named_params.items()}
+            # 4. using that map to update the parameters of the optimizer
+            for obj in result:
+                if isinstance(obj, torch.optim.Optimizer):
+                    obj._switch_parameters(mapping)
 
         for item in result:
             if any(
@@ -1620,14 +1631,10 @@ class Accelerator:
 
         classes_to_check = [torch.utils.data.DataLoader]
 
-        # If we are using `TransformersEngine` we need to convert the model to TE *first*
-        if self.fp8_recipe_handler.backend == "TE":
-            classes_to_check.append(torch.nn.Module)
-
         is_dataloader_present = any(isinstance(obj, torch.utils.data.DataLoader) for obj in args)
 
         result = [
-            self._prepare_one(obj, first_pass=True) if isinstance(obj, tuple(classes_to_check)) else obj
+            self._prepare_one(obj, first_pass=True) if isinstance(obj, torch.utils.data.DataLoader) else obj
             for obj in args
         ]
 
@@ -1788,8 +1795,6 @@ class Accelerator:
                         else scheduler.total_num_steps
                     )
 
-            if self.mixed_precision == "fp8" and self.fp8_recipe_handler.backend == "TE":
-                config_kwargs["bf16"] = {"enabled": True}
             deepspeed_plugin.deepspeed_config_process(must_match=False, **config_kwargs)
             self.deepspeed_config = deepspeed_plugin.deepspeed_config
             kwargs = dict(model=model, config_params=self.deepspeed_config)
@@ -3548,23 +3553,3 @@ class Accelerator:
             raise ValueError(
                 "Backward pass not properly called on LOMO optimizers. Are you sure you passed a LOMO optimizer in accelerator.prepare()?"
             )
-
-    def _fix_optimizer_parameters(self, old_params, result):
-        """
-        Fixes the optimizer parameters inplace to match the new model parameters.
-        """
-        # 2. grabbing new model parameters
-        new_named_params = self._get_named_parameters(model)
-        # 3. building a map from the first to the second
-        mapping = {p: new_named_params[n] for n, p in old_params.items()}
-        # 4. using that map to update the parameters of the optimizer
-        for obj in result:
-            if isinstance(obj, torch.optim.Optimizer):
-                obj._switch_parameters(mapping)
-        return result
-
-    def should_fix_optimizer(self):
-        return (
-            self.device_placement and self.distributed_type == DistributedType.FSDP
-            or (self.mixed_precision == "fp8" and self.fp8_recipe_handler.backend == "TE")
-        )
