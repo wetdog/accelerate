@@ -379,6 +379,9 @@ class Accelerator:
                     else:
                         self.profile_handler = handler
 
+        if mixed_precision == "fp8" and self.fp8_recipe_handler is None:
+            self.fp8_recipe_handler = FP8RecipeKwargs(backend="MSAMP" if is_msamp_available() else "TE")
+
         kwargs = self.init_handler.to_kwargs() if self.init_handler is not None else {}
         self.state = AcceleratorState(
             mixed_precision=mixed_precision,
@@ -1371,68 +1374,67 @@ class Accelerator:
                 " Please rerun your script specifying `--num_processes=1` or by launching with `python {{myscript.py}}`."
             )
 
-        if not hasattr(model, "_original_forward"):
-            if self.native_amp:
-                model._original_forward = model.forward
-                model_forward_func = model.forward.__func__ if hasattr(model.forward, "__func__") else model.forward
-                autocast_context = get_mixed_precision_context_manager(self.native_amp, self.autocast_handler)
-                new_forward = autocast_context(model_forward_func)
-                if hasattr(model.forward, "__func__"):
-                    model.forward = MethodType(new_forward, model)
-                    model.forward = MethodType(convert_outputs_to_fp32(model.forward.__func__), model)
-                else:
-                    model.forward = convert_outputs_to_fp32(new_forward)
+        if self.native_amp:
+            model._original_forward = model.forward
+            model_forward_func = model.forward.__func__ if hasattr(model.forward, "__func__") else model.forward
+            autocast_context = get_mixed_precision_context_manager(self.native_amp, self.autocast_handler)
+            new_forward = autocast_context(model_forward_func)
+            if hasattr(model.forward, "__func__"):
+                model.forward = MethodType(new_forward, model)
+                model.forward = MethodType(convert_outputs_to_fp32(model.forward.__func__), model)
+            else:
+                model.forward = convert_outputs_to_fp32(new_forward)
 
-            # We prepare fp8 after, allowing for bf16 autocast to happen first
-            if getattr(self.fp8_recipe_handler, "backend", None) == "TE":
-                # Import here to keep base imports fast
-                import transformer_engine.common.recipe as te_recipe
-                from transformer_engine.pytorch import fp8_autocast
-                if not has_transformer_engine_layers(model):
-                    with torch.no_grad():
-                        convert_model(model)
-                    model._converted_to_transformer_engine = True
-                    # We need to then save these params now
-                    self.old_named_params = self._get_named_parameters(model)
-                kwargs = self.fp8_recipe_handler.to_kwargs() if self.fp8_recipe_handler is not None else {}
-                if "fp8_format" in kwargs:
-                    kwargs["fp8_format"] = getattr(te_recipe.Format, kwargs["fp8_format"])
-                fp8_recipe = te_recipe.DelayedScaling(**kwargs)
-                # If we are in DDP or FSDP, we delay `autocast` until after FSDP/DDP has been initialized
-                # to make use of the process group
-                if not self.delayed_fp8_autocast:
-                    model.forward = fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)(model.forward)
+        # We prepare fp8 after, allowing for bf16 autocast to happen first
+        if getattr(self.fp8_recipe_handler, "backend", None) == "TE":
+            # Import here to keep base imports fast
+            import transformer_engine.common.recipe as te_recipe
+            from transformer_engine.pytorch import fp8_autocast
+            if not has_transformer_engine_layers(model):
+                with torch.no_grad():
+                    convert_model(model)
+                model._converted_to_transformer_engine = True
+                # We need to then save these params now
+                self.old_named_params = self._get_named_parameters(model)
+            kwargs = self.fp8_recipe_handler.to_kwargs() if self.fp8_recipe_handler is not None else {}
+            if "fp8_format" in kwargs:
+                kwargs["fp8_format"] = getattr(te_recipe.Format, kwargs["fp8_format"])
+            fp8_recipe = te_recipe.DelayedScaling(**kwargs)
+            # If we are in DDP or FSDP, we delay `autocast` until after FSDP/DDP has been initialized
+            # to make use of the process group
+            if not self.delayed_fp8_autocast:
+                model.forward = fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)(model.forward)
 
-            if (getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False)) and getattr(
-                model, "hf_device_map", False
-            ):
-                model_devices = set(model.hf_device_map.values())
-                if len(model_devices) > 1 and self.distributed_type != DistributedType.NO:
-                    raise ValueError(
-                        "You can't train a model that has been loaded in 8-bit precision on multiple devices in any distributed mode."
-                        " In order to use 8-bit models that have been loaded across multiple GPUs the solution is to use Naive Pipeline Parallelism."
-                        " Therefore you should not specify that you are under any distributed regime in your accelerate config."
-                    )
-                elif len(model_devices) == 1:
-                    current_device = list(model_devices)[0]
-                    current_device_index = (
-                        current_device.index if isinstance(current_device, torch.device) else current_device
-                    )
+        if (getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False)) and getattr(
+            model, "hf_device_map", False
+        ):
+            model_devices = set(model.hf_device_map.values())
+            if len(model_devices) > 1 and self.distributed_type != DistributedType.NO:
+                raise ValueError(
+                    "You can't train a model that has been loaded in 8-bit precision on multiple devices in any distributed mode."
+                    " In order to use 8-bit models that have been loaded across multiple GPUs the solution is to use Naive Pipeline Parallelism."
+                    " Therefore you should not specify that you are under any distributed regime in your accelerate config."
+                )
+            elif len(model_devices) == 1:
+                current_device = list(model_devices)[0]
+                current_device_index = (
+                    current_device.index if isinstance(current_device, torch.device) else current_device
+                )
 
-                    if torch.device(current_device_index) != self.device:
-                        # if on the first device (GPU 0) we don't care
-                        if (self.device.index is not None) or (current_device_index != 0):
-                            raise ValueError(
-                                "You can't train a model that has been loaded in 8-bit precision on a different device than the one "
-                                "you're training on. Make sure you loaded the model on the correct device using for example `device_map={'':torch.cuda.current_device()}` or `device_map={'':torch.xpu.current_device()}`"
-                            )
+                if torch.device(current_device_index) != self.device:
+                    # if on the first device (GPU 0) we don't care
+                    if (self.device.index is not None) or (current_device_index != 0):
+                        raise ValueError(
+                            "You can't train a model that has been loaded in 8-bit precision on a different device than the one "
+                            "you're training on. Make sure you loaded the model on the correct device using for example `device_map={'':torch.cuda.current_device()}` or `device_map={'':torch.xpu.current_device()}`"
+                        )
 
-                if "cpu" in model_devices or "disk" in model_devices:
-                    raise ValueError(
-                        "You can't train a model that has been loaded in 8-bit precision with CPU or disk offload."
-                    )
-            elif device_placement and not self.verify_device_map(model):
-                model = model.to(self.device)
+            if "cpu" in model_devices or "disk" in model_devices:
+                raise ValueError(
+                    "You can't train a model that has been loaded in 8-bit precision with CPU or disk offload."
+                )
+        elif device_placement and not self.verify_device_map(model):
+            model = model.to(self.device)
         if not evaluation_mode:
             if self.distributed_type in (
                 DistributedType.MULTI_GPU,
@@ -1629,10 +1631,7 @@ class Accelerator:
 
         deepspeed_plugin = self.state.deepspeed_plugin
 
-        classes_to_check = [torch.utils.data.DataLoader]
-
         is_dataloader_present = any(isinstance(obj, torch.utils.data.DataLoader) for obj in args)
-
         result = [
             self._prepare_one(obj, first_pass=True) if isinstance(obj, torch.utils.data.DataLoader) else obj
             for obj in args
